@@ -1,5 +1,5 @@
 % ===================================================
-% EMS VCS3 Continuous-Time Model Simulation
+% EMS VCS3 Continuous-Time Model Simulation with Cutoff Control
 % ===================================================
 
 clear; clc; close all;
@@ -7,21 +7,28 @@ clear; clc; close all;
 % ------------------------------
 % Define Filter Parameters
 % ------------------------------
-I0 = 1e-3;     % Bias current (A)
 C = 0.1e-6;    % Capacitance (F)
 eta = 1.836;  
 VT = 26e-3;    % Thermal voltage (V)
 gamma = eta * VT;  % 48mV
-K = 1;         % Feedback gain
+K = 0.8;         % Feedback gain
+
+% ------------------------------
+% Set Desired Cutoff Frequency (Hz)
+% ------------------------------
+fc = 10000;  % Set desired cutoff frequency in Hz
+
+% Compute Bias Current I0 using formula: I0 = 2 * pi * C * eta * VT * fc
+I0 = 2 * pi * C * eta * VT * fc;
 
 % ------------------------------
 % Continuous-Time Simulation
 % ------------------------------
-Tmax = 0.01;    % 10ms simulation
-Fs = 44100;     % Sampling rate (for FFT)
+Tmax = 0.05;    % 50ms simulation for better FFT resolution
+Fs = 48000;     % Sampling rate (for FFT)
 
 % Time vector for input interpolation
-tspan = linspace(0, Tmax, 1000); 
+tspan = linspace(0, Tmax, 5000);  % High-resolution time vector
 vIN = @(t) sin(2*pi*100*t);  % 100 Hz sine wave input
 
 % Initial conditions (capacitor voltages start at 0)
@@ -41,7 +48,7 @@ subplot(2,1,1);
 plot(t, vIN(t), 'r', 'LineWidth', 1.5); hold on;
 plot(t, vOUT, 'b', 'LineWidth', 1.5);
 xlabel('Time (s)'); ylabel('Voltage (V)');
-title('Input vs. Output Voltage');
+title(['Input vs. Output Voltage (Cutoff = ', num2str(fc), ' Hz)']);
 legend('Input (vIN)', 'Output (vOUT)');
 grid on;
 
@@ -53,7 +60,7 @@ legend('vC1', 'vC2', 'vC3', 'vC4');
 grid on;
 
 % ===================================================
-% FREQUENCY RESPONSE ANALYSIS (Impulse Response & FFT)
+% FREQUENCY RESPONSE ANALYSIS
 % ===================================================
 
 % ------------------------------
@@ -66,25 +73,19 @@ vOUT_impulse = (K + 1/2) * vC_imp(:,4);
 % ------------------------------
 % Compute FFT of Impulse Response
 % ------------------------------
-N = length(vOUT_impulse);
-f = linspace(0, Fs/2, floor(N/2)); % Frequency axis
-VOUT_FFT = abs(fft(vOUT_impulse)); % Compute magnitude response
-VOUT_FFT = VOUT_FFT(1:floor(N/2)); % Keep positive frequencies
+NFFT = 2^nextpow2(length(vOUT_impulse)); % Zero-pad to power of 2
+f = linspace(20, 20000, NFFT/2); % Log frequency axis
+VOUT_FFT = abs(fft(vOUT_impulse, NFFT)); % Compute magnitude response
+VOUT_FFT = VOUT_FFT(1:NFFT/2); % Keep positive frequencies
 
 % ------------------------------
-% Plot Frequency Response
+% Plot Frequency Response (Corrected)
 % ------------------------------
 figure;
-subplot(2,1,1);
-plot(t_imp, vOUT_impulse, 'b', 'LineWidth', 1.2);
-xlabel('Time (s)'); ylabel('Output Voltage (V)');
-title('Impulse Response');
-grid on;
-
-subplot(2,1,2);
-semilogx(f, 20*log10(VOUT_FFT), 'r', 'LineWidth', 1.2);
+semilogx(f, 20*log10(VOUT_FFT), 'r', 'LineWidth', 1.5);
 xlabel('Frequency (Hz)'); ylabel('Magnitude (dB)');
-title('Estimated Frequency Response (FFT of Impulse Response)');
+title(['Estimated Frequency Response (Cutoff = ', num2str(fc), ' Hz)']);
+xlim([20 20000]); % Limit to 20 Hz - 20 kHz
 grid on;
 
 % ===================================================
