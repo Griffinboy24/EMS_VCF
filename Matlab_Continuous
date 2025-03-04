@@ -11,12 +11,12 @@ C = 0.1e-6;    % Capacitance (F)
 eta = 1.836;  
 VT = 26e-3;    % Thermal voltage (V)
 gamma = eta * VT;  % 48mV
-K = 0.8;         % Feedback gain
+K = 1;         % Feedback gain
 
 % ------------------------------
 % Set Desired Cutoff Frequency (Hz)
 % ------------------------------
-fc = 10000;  % Set desired cutoff frequency in Hz
+fc = 1000;  % Set desired cutoff frequency in Hz
 
 % Compute Bias Current I0 using formula: I0 = 2 * pi * C * eta * VT * fc
 I0 = 2 * pi * C * eta * VT * fc;
