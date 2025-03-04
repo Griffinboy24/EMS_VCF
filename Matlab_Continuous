@@ -1,0 +1,116 @@
+% ===================================================
+% EMS VCS3 Continuous-Time Model Simulation
+% ===================================================
+
+clear; clc; close all;
+
+% ------------------------------
+% Define Filter Parameters
+% ------------------------------
+I0 = 1e-3;     % Bias current (A)
+C = 0.1e-6;    % Capacitance (F)
+eta = 1.836;  
+VT = 26e-3;    % Thermal voltage (V)
+gamma = eta * VT;  % 48mV
+K = 1;         % Feedback gain
+
+% ------------------------------
+% Continuous-Time Simulation
+% ------------------------------
+Tmax = 0.01;    % 10ms simulation
+Fs = 44100;     % Sampling rate (for FFT)
+
+% Time vector for input interpolation
+tspan = linspace(0, Tmax, 1000); 
+vIN = @(t) sin(2*pi*100*t);  % 100 Hz sine wave input
+
+% Initial conditions (capacitor voltages start at 0)
+vC0 = zeros(4,1);
+
+% Solve system with ode45
+[t, vC] = ode45(@(t, vC) vcs3_filter(t, vC, vIN, tspan, I0, C, gamma, VT, K), tspan, vC0);
+
+% Compute Output Voltage
+vOUT = (K + 1/2) * vC(:,4);
+
+% ------------------------------
+% Plot Time-Domain Response
+% ------------------------------
+figure;
+subplot(2,1,1);
+plot(t, vIN(t), 'r', 'LineWidth', 1.5); hold on;
+plot(t, vOUT, 'b', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Voltage (V)');
+title('Input vs. Output Voltage');
+legend('Input (vIN)', 'Output (vOUT)');
+grid on;
+
+subplot(2,1,2);
+plot(t, vC, 'LineWidth', 1.2);
+xlabel('Time (s)'); ylabel('Capacitor Voltages (V)');
+title('State Variables (Capacitor Voltages)');
+legend('vC1', 'vC2', 'vC3', 'vC4');
+grid on;
+
+% ===================================================
+% FREQUENCY RESPONSE ANALYSIS (Impulse Response & FFT)
+% ===================================================
+
+% ------------------------------
+% Compute Impulse Response
+% ------------------------------
+vIN_impulse = @(t) double(t == 0);  % Dirac delta at t = 0
+[t_imp, vC_imp] = ode45(@(t, vC) vcs3_filter(t, vC, vIN_impulse, tspan, I0, C, gamma, VT, K), tspan, vC0);
+vOUT_impulse = (K + 1/2) * vC_imp(:,4);
+
+% ------------------------------
+% Compute FFT of Impulse Response
+% ------------------------------
+N = length(vOUT_impulse);
+f = linspace(0, Fs/2, floor(N/2)); % Frequency axis
+VOUT_FFT = abs(fft(vOUT_impulse)); % Compute magnitude response
+VOUT_FFT = VOUT_FFT(1:floor(N/2)); % Keep positive frequencies
+
+% ------------------------------
+% Plot Frequency Response
+% ------------------------------
+figure;
+subplot(2,1,1);
+plot(t_imp, vOUT_impulse, 'b', 'LineWidth', 1.2);
+xlabel('Time (s)'); ylabel('Output Voltage (V)');
+title('Impulse Response');
+grid on;
+
+subplot(2,1,2);
+semilogx(f, 20*log10(VOUT_FFT), 'r', 'LineWidth', 1.2);
+xlabel('Frequency (Hz)'); ylabel('Magnitude (dB)');
+title('Estimated Frequency Response (FFT of Impulse Response)');
+grid on;
+
+% ===================================================
+% EMS VCS3 Filter Function (Nonlinear ODE System)
+% ===================================================
+function dvCdt = vcs3_filter(t, vC, vIN, tspan, I0, C, gamma, VT, K)
+    % Extract state variables
+    vC1 = vC(1);
+    vC2 = vC(2);
+    vC3 = vC(3);
+    vC4 = vC(4);
+    
+    % Interpolate input voltage to match time step
+    vIN_t = interp1(tspan, vIN(tspan), t, 'linear', 'extrap');
+
+    % Compute nonlinear functions
+    f1 = tanh((vIN_t - (K + 1/2) * vC4) / (2*VT));
+    f2 = tanh((vC2 - vC1) / (2*gamma));
+    f3 = tanh((vC3 - vC2) / (2*gamma));
+    f4 = tanh((vC4 - vC3) / (2*gamma));
+    f5 = tanh(-vC4 / (6*gamma));
+
+    % Define system of differential equations
+    dvCdt = zeros(4,1);
+    dvCdt(1) = (I0 / (2*C)) * (f1 + f2);
+    dvCdt(2) = (I0 / (2*C)) * (f3 - f2);
+    dvCdt(3) = (I0 / (2*C)) * (f4 - f3);
+    dvCdt(4) = (I0 / (2*C)) * (-f5 - f4);
+end
