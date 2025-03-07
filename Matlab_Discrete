@@ -1,37 +1,46 @@
-% =========================================================================
-% EMS VCS3 VCF - EXACT IMPLEMENTATION (Zambon & Fontana, 2011)
-% Using self-generated pink noise via Paul Kellet's algorithm.
-% =========================================================================
+%% EMS VCS3 VCF EXACT IMPLEMENTATION WITH DEBUG OUTPUT
+% This script implements the EMS VCS3 filter model exactly as described in:
+%   Zambon, S. & Fontana, F. (2011). Efficient Polynomial Implementation of the EMS VCS3 Filter Model.
+%   Proc. of the 14th International Conference on Digital Audio Effects (DAFx-11).
+%
+% All equations (Eqs. (2), (4), (7)-(11)) and numerical methods (trapezoidal rule
+% with Newton–Raphson using LU decomposition with pivoting) are implemented exactly
+% as in the paper. Debug prints in the Newton–Raphson solver provide convergence info.
 
 clc; clear; close all;
 
-%% ------------------ 1) Define Constants and Desired fc ------------------
-C       = 0.1e-6;         % 0.1 microfarad
-eta     = 1.836;          
-VT      = 26e-3;          % 26 mV
-gamma   = eta * VT;       % ~48 mV
+%% Debug flag (set to true to print Newton–Raphson iteration details)
+global debugFlag;
+debugFlag = false;
 
-fc      = 1000;           % desired cutoff frequency (Hz)
-K       = 1;              % feedback gain
+%% 1) Define Constants and Desired Cutoff Frequency
+C       = 0.1e-6;    % 0.1 µF
+eta     = 1.836;
+VT      = 26e-3;     % 26 mV
+gamma   = eta * VT;  % ~48 mV
 
-% Choose I0 so that the small-signal pole is near fc.
-I0 = 2 * C * (2*pi*fc);   % simple approximation
+fc      = 250;      % desired cutoff frequency (Hz)
+K       = 0.1;         % feedback gain
 
-%% ------------------ 2) Discretization Parameters ------------------
-Fs         = 44100;                 % base sampling rate (Hz)
-T          = 1 / Fs;               
-oversample = 8;                    
-Fs_os      = Fs * oversample;      
-T_os       = 1 / Fs_os;            
+% Set bias current I0 so that the small-signal pole is near fc (per paper)
+I0 = 2 * C * (2*pi*fc);
 
-%% ------------------ 3) Generate and Upsample Pink Noise ------------------
-% Generate pink noise using Paul Kellet's algorithm.
-duration = 10;                % seconds
+%% 2) Discretization Parameters
+Fs         = 44100;           % base sampling rate (Hz)
+T          = 1 / Fs;          % base sampling period
+oversample = 8;               % oversampling factor
+Fs_os      = Fs * oversample;  % oversampled rate
+T_os       = 1 / Fs_os;       % oversampled period
+
+%% 3) Generate and Upsample Pink Noise (Paul Kellet's Algorithm)
+duration = 5;              % seconds of noise
 N = Fs * duration;
 white = randn(N,1);
-% Paul Kellet's filter coefficients:
+
+% Paul Kellet's pink noise filter coefficients:
 b = [0.049922035, -0.095993537, 0.050612699, -0.004408786];
 a = [1, -2.494956002, 2.017265875, -0.522189400];
+
 pinkNoise = filter(b, a, white);
 pinkNoise = pinkNoise / max(abs(pinkNoise));  % normalize to ±1
 
@@ -39,132 +48,194 @@ pinkNoise = pinkNoise / max(abs(pinkNoise));  % normalize to ±1
 inputScale = 0.05;
 pinkNoise = pinkNoise * inputScale;
 
-% Upsample to Fs_os:
+% Upsample noise to Fs_os using MATLAB’s resample (with a 100-tap FIR)
 pinkNoise_os = resample(pinkNoise, oversample, 1, 100);
-y_os = zeros(size(pinkNoise_os));
+N_os = length(pinkNoise_os);
 
-%% ------------------ 4) Initialize State Variables ------------------
-% State vector x = [x1; x2; x3; x4; x5] as in Eq. (2)
-x   = zeros(5,1);
-vC4 = 0;  % Capacitor voltage (vOUT = (K + 1/2)*vC4)
+%% 4) Initialize State Variables and Integration Variables
+% State vector x = [x1; x2; x3; x4; x5] per Eq. (2) in the paper
+x = zeros(5,1);
 
-% Initialize auxiliary variable F0 per Eq. (7): F0(0) = (T_os/2)*f(ṽ0,x0)
+% The capacitor voltage vC4 is integrated separately; the output is:
+%   vOUT = (K + 0.5)*vC4
+vC4 = 0;
+
+% Initialize input sample and state derivative f(x,vIN) from Eq. (4)
 vIN0 = pinkNoise_os(1);
-f0   = vcs3_filter_dynamics(x, vIN0, I0, C, VT, gamma, K);
-F0   = (T_os/2) * f0;
+f0 = vcs3_filter_dynamics(x, vIN0, I0, C, VT, gamma, K);
 
-% Initialize previous derivative for trapezoidal integration of vC4.
+% Initialize auxiliary variable F0 per Eq. (7): F0(0) = (T_os/2)*f0
+F0 = (T_os/2) * f0;
+
+% For trapezoidal integration of vC4, initialize previous derivative from:
+%   v̇C4 = -(I0/(2*C))*(x5 + x3)
 f_prev = -(I0/(2*C)) * (x(5) + x(3));
 
-%% ------------------ 5) Filter Processing (Oversampled) ------------------
-N_os = length(pinkNoise_os);
+% Preallocate output vector for oversampled processing:
+y_os = zeros(N_os,1);
+
+%% 5) Filter Processing Loop (Oversampled Integration)
 for n = 1:N_os-1
+    % Next input sample:
     vIN_next = pinkNoise_os(n+1);
     
-    % Newton–Raphson update to compute new state (and update F0)
+    % Newton–Raphson update to solve the implicit equation (Eq. (7)):
+    %   F(ξ) = F0 + (T_os/2)*f(vIN_next,ξ) - ξ = 0
+    % with initial guess ξ₀ = x, solved using LU decomposition.
     [x, F0] = vcs3_step(x, F0, vIN_next, I0, C, VT, gamma, K, T_os);
     
     % Trapezoidal integration of vC4:
+    % The derivative is given by v̇C4 = -(I0/(2*C))*(x5 + x3) (per paper)
     f_now = -(I0/(2*C)) * (x(5) + x(3));
-    vC4   = vC4 + (T_os/2) * (f_prev + f_now);
+    vC4 = vC4 + (T_os/2) * (f_prev + f_now);
     f_prev = f_now;
     
-    % Filter output:
+    % Synchronize state variables x4 and x5 with vC4 per Eq. (2)
+    x(4) = tanh( - (K+0.5) * vC4 / (2*VT) );
+    x(5) = tanh( vC4 / (6*gamma) );
+    
+    % Filter output: vOUT = (K + 0.5)*vC4
     y_os(n) = (K + 0.5) * vC4;
 end
 
-%% ------------------ 6) Downsample & Save Output ------------------
+%% 6) Downsample and Save Output
 y = resample(y_os, 1, oversample, 100);
 audiowrite('Filtered_PinkNoise.wav', y, Fs);
 
-%% ==================== Local Functions ================================
-%% -------------------------------------------------------------------------
+%% ===================== Local Functions ================================
+
 function dx = vcs3_filter_dynamics(x, vIN, I0, C, VT, gamma, K)
-    % Computes the derivative vector (Eq. (4)) using the addition formula.
+% Computes the state derivative vector f(x,vIN) as per Eq. (4) in the paper.
+% Inputs:
+%   x   : state vector [x1; x2; x3; x4; x5]
+%   vIN : current input voltage sample
+%   I0, C, VT, gamma, K : filter parameters (per paper)
+% Output:
+%   dx  : derivative of state vector
+%
+% The nonlinearity tanh((vIN - vOUT)/(2VT)) is replaced by the addition
+% formula: (v_tilde + x4)/(1 + v_tilde*x4), where v_tilde = tanh(vIN/(2VT)).
+
+    % Compute v_tilde = tanh(vIN/(2VT))
     v_tilde = tanh(vIN/(2*VT));
-    x1 = x(1); x2 = x(2); x3 = x(3); x4 = x(4); x5 = x(5);
     
+    % Coefficient definitions (from Eq. (4))
     c1 = I0/(4*C*gamma);
     c2 = I0/(4*C*gamma);
     c3 = I0/(4*C*gamma);
     c4 = I0*(K+0.5)/(4*C*VT);
     c5 = I0/(12*C*gamma);
     
-    % Clamp denominator to avoid division by zero:
-    denom = 1 - v_tilde*x4;
-    if abs(denom) < 1e-9, denom = sign(denom)*1e-9; end
+    % Correct nonlinearity using the addition formula:
+    nonlin = (v_tilde + x(4)) / (1 + v_tilde*x(4));
     
+    % Compute state derivatives exactly as in Eq. (4):
     dx = zeros(5,1);
-    dx(1) = c1 * ((x2 - v_tilde - x4) / denom) * (1 - x1^2);
-    dx(2) = c2 * (x3 - 2*x2 + x1) * (1 - x2^2);
-    dx(3) = c3 * (-x5 - 2*x3 - x2) * (1 - x3^2);
-    dx(4) = c4 * (-x5 - x3) * (1 - x4^2);
-    dx(5) = c5 * (-x5 - x3) * (1 - x5^2);
+    dx(1) = c1 * (x(2) - nonlin) * (1 - x(1)^2);
+    dx(2) = c2 * (x(3) - 2*x(2) + x(1)) * (1 - x(2)^2);
+    dx(3) = c3 * (-x(5) - 2*x(3) - x(2)) * (1 - x(3)^2);
+    dx(4) = c4 * (-x(5) - x(3)) * (1 - x(4)^2);
+    dx(5) = c5 * (-x(5) - x(3)) * (1 - x(5)^2);
 end
 
-%% -------------------------------------------------------------------------
 function [x_next, F0_next] = vcs3_step(x, F0, vIN_next, I0, C, VT, gamma, K, T)
-    % Newton–Raphson solver for the implicit equation:
-    % F(ξ) = F0 + (T/2)*f(v_tilde,ξ) - ξ = 0, where v_tilde = tanh(vIN_next/(2*VT)).
+% Newton–Raphson solver for the implicit equation in Eq. (7):
+%   F(ξ) = F0 + (T/2)*f(vIN_next,ξ) - ξ = 0.
+%
+% The auxiliary variable F0 is updated per Eq. (8): F0_next = 2*x_next - F0.
+%
+% Inputs:
+%   x       : current state vector (initial guess)
+%   F0      : auxiliary variable from the previous time step
+%   vIN_next: next input sample
+%   T       : oversampled time step T_os
+%
+% Outputs:
+%   x_next  : updated state vector (solution at time n+1)
+%   F0_next : updated auxiliary variable
+
+    global debugFlag;
     x_next   = x;
     max_iter = 10;
     tol      = 1e-8;
     
+    % Precompute v_tilde for the current input sample at time n+1
     v_tilde = tanh(vIN_next/(2*VT));
+    
     for iter = 1:max_iter
+        % Evaluate the dynamics f(x,vIN_next) at x_next:
         f_val = vcs3_filter_dynamics(x_next, vIN_next, I0, C, VT, gamma, K);
-        F = F0 + (T/2)*f_val - x_next;
+        % Form the residual F(ξ) from Eq. (7):
+        F_res = F0 + (T/2)*f_val - x_next;
         
+        % Compute the Jacobian J_f of f(x,vIN_next) (Eq. (11))
         J_f = compute_jacobian(x_next, v_tilde, I0, C, VT, gamma, K);
+        % Jacobian of F: J_F = (T/2)*J_f - I
         J_F = (T/2)*J_f - eye(5);
         
-        if rcond(J_F) < 1e-12
-            delta = pinv(J_F)*(-F);
-        else
-            delta = J_F\(-F);
+        % Solve the linear system J_F * delta = -F_res using LU decomposition with pivoting
+        [L, U, P] = lu(J_F);
+        delta = U \ (L \ (P * (-F_res)));
+        
+        x_next = x_next + delta;
+        
+        % Debug print: iteration count and norm of delta and residual
+        if debugFlag
+            fprintf('Newton iter %d: norm(delta,inf)= %e, norm(F_res,inf)= %e\n', iter, norm(delta,inf), norm(F_res,inf));
         end
         
-        % (Optionally, you can add damping here if needed.)
-        x_next = x_next + delta;
         if norm(delta, inf) < tol
             break;
         end
     end
-    F0_next = 2*x_next - F0;  % Update F0 per Eq. (8)
+    if iter == max_iter && norm(delta,inf) >= tol && debugFlag
+        warning('Newton–Raphson did not converge within %d iterations; final norm(delta,inf)= %e', max_iter, norm(delta,inf));
+    end
+    % Update F0 for the next time step as per Eq. (8)
+    F0_next = 2*x_next - F0;
 end
 
-%% -------------------------------------------------------------------------
 function J_f = compute_jacobian(x, v_tilde, I0, C, VT, gamma, K)
-    % Computes the Jacobian matrix (Eq. (11)) of the dynamics function.
+% Computes the Jacobian matrix J_f = ∂f/∂x (Eq. (11) in the paper)
+% Inputs:
+%   x      : current state vector [x1; x2; x3; x4; x5]
+%   v_tilde: tanh(vIN/(2VT)) for the current input sample
+%
+% Output:
+%   J_f    : 5x5 Jacobian matrix
+
+    % Unpack state variables:
     x1 = x(1); x2 = x(2); x3 = x(3); x4 = x(4); x5 = x(5);
     
+    % Coefficient definitions (from Eq. (4))
     c1 = I0/(4*C*gamma);
     c2 = I0/(4*C*gamma);
     c3 = I0/(4*C*gamma);
     c4 = I0*(K+0.5)/(4*C*VT);
     c5 = I0/(12*C*gamma);
     
+    % d-terms (from Eq. (4)): 1 - xi^2
     d1 = 1 - x1^2;
     d2 = 1 - x2^2;
     d3 = 1 - x3^2;
     d4 = 1 - x4^2;
     d5 = 1 - x5^2;
     
-    t1 = x2 - v_tilde - x4;
+    % t-terms as in Eq. (11):
+    t1 = x2 - (v_tilde + x4)/(1 + v_tilde*x4);
     t2 = x3 - 2*x2 + x1;
     t3 = -x5 - 2*x3 - x2;
     t4 = -x5 - x3;
     t5 = -x5 - x3;
     
-    denom = (1 - v_tilde*x4)^2;
-    if abs(denom) < 1e-12, denom = 1e-12; end
-    f_v = (v_tilde^2 - 1) / denom;
+    % Derivative of the nonlinearity (v_tilde + x4)/(1 + v_tilde*x4) with respect to x4:
+    fv = (1 - v_tilde^2) / ((1 + v_tilde*x4)^2);
     
-    J_f = -[ ...
-        2*c1*(d1 + t1*x1),   -c1*d1,             0,         c1*d1*f_v,       0; ...
-        -c2*d2,              2*c2*(d2 + t2*x2),   -c2*d2,    0,               0; ...
-         0,                  -c3*d3,             2*c3*(d3 + t3*x3),  0,         c3*d3; ...
-         0,                   0,                  c4*d4,     2*c4*t4*x4,     c4*d4; ...
-         0,                   0,                  c5*d5,     0,              c5*(d5+2*t5*x5) ...
-    ];
+    % Assemble the Jacobian matrix exactly as given in Eq. (11)
+    J_f = -[...
+         2*c1*(d1 + t1*x1),    -c1*d1,             0,       c1*d1*fv,         0;...
+         -c2*d2,         2*c2*(d2 + t2*x2),   -c2*d2,  0,                0;...
+         0,              -c3*d3,             2*c3*(d3 + t3*x3), 0,       c3*d3;...
+         0,               0,                 c4*d4,   2*c4*t4*x4,      c4*d4;...
+         0,               0,                 c5*d5,   0,               c5*(d5+2*t5*x5)];
 end
