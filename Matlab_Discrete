@@ -5,11 +5,13 @@
 %   Proc. of the 14th International Conference on Digital Audio Effects (DAFx-11).
 %
 % It supports sample rate conversion and file dialogs for both input and output.
-% The input signal is normalized and scaled to a tens-of-mV range (e.g., ±50 mV).
+% The input signal is normalized and scaled to a tens-of-mV range (e.g., +/-50 mV).
+% A short period of silence is prepended to the signal to remove any processing artefacts,
+% which is then removed from the final output.
 
 clc; clear; close all;
 
-%% Debug flag (set to true to print Newton–Raphson iteration details)
+%% Debug flag (set to true to print Newton-Raphson iteration details)
 debugFlag = false;
 
 %% 1) Open file dialog to select input WAV file
@@ -33,13 +35,17 @@ if inFs ~= Fs
 end
 
 %% 3) Normalize and Scale Input Signal
-% Normalize the input to ±1 and then scale to a tens-of-mV range (e.g., ±50 mV)
+% Normalize the input to +/-1 and then scale to a tens-of-mV range (e.g., +/-50 mV)
 if max(abs(inSignal)) > 0
     inSignal = inSignal / max(abs(inSignal));
 end
-
-inputScale = 0.05;  % Scale factor (e.g., ±50 mV)
+inputScale = 0.05;  % Scale factor (e.g., +/-50 mV)
 inSignal = inSignal * inputScale;
+
+%% 3.1) Prepend Silence Padding
+preSilenceDuration = 0.5; % duration in seconds of silence to prepend
+preSilenceSamples = round(preSilenceDuration * Fs);
+inSignal = [zeros(preSilenceSamples,1); inSignal];
 
 %% 4) Discretization Parameters and Oversampling
 T          = 1 / Fs;           % Base sampling period
@@ -52,23 +58,23 @@ inSignal_os = resample(inSignal, oversample, 1, 100);
 N_os = length(inSignal_os);
 
 %% 5) Define Filter Constants and Desired Cutoff Frequency
-C       = 0.1e-6;    % 0.1 µF
+% Here we use the full cutoff frequency (fc) so that the small-signal pole is at 2*pi*fc.
+C       = 0.1e-6;    % 0.1 uF
 eta     = 1.836;
 VT      = 26e-3;     % 26 mV
 gamma   = eta * VT;  % ~48 mV
 
-fc_start = 100 / 2;      % Initial cutoff frequency (Hz)
-fc_end   = 2000 / 2;     % Final cutoff frequency (Hz)
-K       = 0.0;       % Feedback gain
+fc_start = 100;   % Initial cutoff frequency (Hz)
+fc_end   = 2000;  % Final cutoff frequency (Hz)
+K       = 0.0;    % Feedback gain
 
-fc = fc_start;       % Initial cutoff
+fc = fc_start;    % Initial cutoff
 
 % --- Corrected cutoff scaling ---
-% Per the paper, the small-signal pole is at I0/(2C). Setting I0 = 2*C*(2*pi*fc)
-% places the pole at 2*pi*fc.
+% Set I0 so that the small-signal pole is at 2*pi*fc. Thus:
 I0 = 2 * C * (2*pi*fc);  % I0 = 4*pi*C*fc
 
-% Precompute filter coefficients (see Eq. (4) in the paper)
+% Precompute filter coefficients per Eq. (4)
 c1 = I0/(4*C*gamma);
 c2 = I0/(4*C*gamma);
 c3 = I0/(4*C*gamma);
@@ -78,7 +84,7 @@ filterCoeffs = struct('c1', c1, 'c2', c2, 'c3', c3, 'c4', c4, 'c5', c5, ...
                       'VT', VT, 'gamma', gamma, 'K', K, 'I0', I0, 'C', C);
 
 %% 6) Initialize State Variables and Integration Variables
-% State vector x = [x1; x2; x3; x4; x5] per Eq. (2) in the paper
+% State vector x = [x1; x2; x3; x4; x5] per Eq. (2)
 x = zeros(5,1);
 
 % The capacitor voltage vC4 is integrated separately; the output is:
@@ -88,17 +94,20 @@ vC4 = 0;
 % Initialize first input sample and compute initial state derivative
 vIN0 = inSignal_os(1);
 f0 = vcs3_filter_dynamics(x, vIN0, filterCoeffs); % Compute f(x,vIN)
-F0 = (T_os/2) * f0;   % Initialize auxiliary variable per Eq. (7)
+F0 = (T_os/2) * f0;   % Auxiliary variable per Eq. (7)
 
 % For trapezoidal integration of vC4, initialize the previous derivative:
-%   v̇C4 = -(I0/(2*C))*(x5 + x3)
-f_prev = -(I0/(2*C))*(x(5) + x(3));
+%   v_dot_C4 = -(I0/(2*C))*(x5 + x3)
+f_prev = -(filterCoeffs.I0/(2*filterCoeffs.C))*(x(5) + x(3));
 
 % Preallocate output vector for oversampled processing
 y_os = zeros(N_os,1);
 
-% Set up cutoff modulation (linear ramp from fc_start to fc_end)
-fc_values = linspace(fc_start, fc_end, N_os);
+% Set up cutoff modulation (logarithmic ramp from fc_start to fc_end for perceptually linear modulation)
+fc_values = logspace(log10(fc_start), log10(fc_end), N_os);
+
+% For integration consistency, store previous I0
+prev_I0 = filterCoeffs.I0;
 
 %% 7) Filter Processing Loop (Oversampled Integration)
 lastProgress = 0;
@@ -113,7 +122,7 @@ for n = 1:N_os-1
     
     % Update cutoff frequency and compute new I0 for this sample
     fc = fc_values(n);
-    I0 = 2 * C * (2*pi*fc);  % <-- Use fc directly (do not halve fc)
+    I0 = 2 * C * (2*pi*fc);  % Use fc directly (full cutoff frequency)
     
     % Update filter coefficients with the new I0
     filterCoeffs.I0 = I0;
@@ -126,18 +135,21 @@ for n = 1:N_os-1
     % Get next input sample
     vIN_next = inSignal_os(n+1);
     
-    % Newton–Raphson step to solve the implicit equation (Eq. (7))
+    % Newton-Raphson step to solve the implicit equation (Eq. (7))
     [x, F0] = vcs3_step(x, F0, vIN_next, filterCoeffs, T_os, debugFlag);
     
     % Trapezoidal integration of vC4:
-    % v̇C4 = -(I0/(2*C))*(x5 + x3) per the paper
+    % For consistency, use the slope from the previous iteration computed with prev_I0.
+    f_prev = -(prev_I0/(2*C))*(x(5) + x(3));  
     f_now = -(I0/(2*C))*(x(5) + x(3));
     vC4 = vC4 + (T_os/2) * (f_prev + f_now);
-    f_prev = f_now;
     
-    % Update auxiliary states per Eq. (2)
-    % x4 = tanh( - (K+0.5)*vC4/(2*VT) )
-    % x5 = tanh( vC4/(6*gamma) )
+    % Update prev_I0 for next iteration
+    prev_I0 = I0;
+    
+    % Update auxiliary states per Eq. (2):
+    %   x4 = tanh( - (K+0.5)*vC4/(2*VT) )
+    %   x5 = tanh( vC4/(6*gamma) )
     x(4) = tanh( - (filterCoeffs.K+0.5) * vC4 / (2*filterCoeffs.VT) );
     x(5) = tanh( vC4 / (6*filterCoeffs.gamma) );
     
@@ -150,6 +162,12 @@ fprintf('\n');
 outputScale = 2.0;  % Adjust output volume scaling as needed
 y = resample(y_os, 1, oversample, 100);
 y = y * outputScale;  % Apply output scaling
+
+% Remove the initial silence that was added
+preSilenceSamples_final = round(preSilenceDuration * Fs);
+if length(y) > preSilenceSamples_final
+    y = y(preSilenceSamples_final+1:end);
+end
 
 [outputFileName, outputPath] = uiputfile('*.wav','Save Processed WAV File As');
 if isequal(outputFileName,0)
@@ -164,8 +182,8 @@ disp(['Processed file saved as: ', outputFile]);
 
 function dx = vcs3_filter_dynamics(x, vIN, filterCoeffs)
 % Computes the state derivative vector f(x,vIN) as per Eq. (4) in the paper.
-% The nonlinearity tanh((vIN - vOUT)/(2VT)) is replaced by the addition formula:
-%   (v_tilde + x4)/(1 + v_tilde*x4), where v_tilde = tanh(vIN/(2VT)).
+% The nonlinearity tanh((vIN - vOUT)/(2*VT)) is replaced by the addition formula:
+%   (v_tilde + x4)/(1 + v_tilde*x4), where v_tilde = tanh(vIN/(2*VT)).
     v_tilde = tanh(vIN/(2*filterCoeffs.VT));
     c1 = filterCoeffs.c1;
     c2 = filterCoeffs.c2;
@@ -173,7 +191,6 @@ function dx = vcs3_filter_dynamics(x, vIN, filterCoeffs)
     c4 = filterCoeffs.c4;
     c5 = filterCoeffs.c5;
     
-    % Addition formula for the nonlinearity:
     nonlin = (v_tilde + x(4))/(1 + v_tilde*x(4));
     
     dx = zeros(5,1);
@@ -185,13 +202,14 @@ function dx = vcs3_filter_dynamics(x, vIN, filterCoeffs)
 end
 
 function [x_next, F0_next] = vcs3_step(x, F0, vIN_next, filterCoeffs, T, debugFlag)
-% Newton–Raphson solver for the implicit equation in Eq. (7):
-%   F(ξ) = F0 + (T/2)*f(vIN_next,ξ) - ξ = 0.
+% Newton-Raphson solver for the implicit equation in Eq. (7):
+%   F(x) = F0 + (T/2)*f(vIN_next,x) - x = 0.
 % The auxiliary variable is updated per Eq. (8): F0_next = 2*x_next - F0.
     x_next   = x;
     max_iter = 10;
     tol      = 1e-8;
     v_tilde = tanh(vIN_next/(2*filterCoeffs.VT));
+    
     for iter = 1:max_iter
         f_val = vcs3_filter_dynamics(x_next, vIN_next, filterCoeffs);
         F_res = F0 + (T/2)*f_val - x_next;
@@ -199,22 +217,38 @@ function [x_next, F0_next] = vcs3_step(x, F0, vIN_next, filterCoeffs, T, debugFl
         J_F = (T/2)*J_f - eye(5);
         [L, U, P] = lu(J_F);
         delta = U \ (L \ (P * (-F_res)));
-        x_next = x_next + delta;
+        
+        lambda = 1;
+        F_res_norm = norm(F_res, inf);
+        while lambda > 1e-3
+            x_candidate = x_next + lambda * delta;
+            f_candidate = vcs3_filter_dynamics(x_candidate, vIN_next, filterCoeffs);
+            F_candidate = F0 + (T/2)*f_candidate - x_candidate;
+            if norm(F_candidate, inf) < F_res_norm
+                break;
+            else
+                lambda = lambda / 2;
+            end
+        end
+        
+        x_next = x_next + lambda * delta;
+        
         if debugFlag
-            fprintf('Newton iter %d: norm(delta,inf)= %e, norm(F_res,inf)= %e\n', iter, norm(delta,inf), norm(F_res,inf));
+            fprintf('Newton iter %d: lambda = %f, norm(delta,inf)= %e, norm(F_res,inf)= %e\n', ...
+                iter, lambda, norm(delta,inf), norm(F_res,inf));
         end
         if norm(delta, inf) < tol
             break;
         end
     end
     if iter == max_iter && norm(delta,inf) >= tol && debugFlag
-        warning('Newton–Raphson did not converge within %d iterations; final norm(delta,inf)= %e', max_iter, norm(delta,inf));
+        warning('Newton-Raphson did not converge within %d iterations; final norm(delta,inf)= %e', max_iter, norm(delta,inf));
     end
     F0_next = 2*x_next - F0;
 end
 
 function J_f = compute_jacobian(x, v_tilde, filterCoeffs)
-% Computes the Jacobian matrix J_f = ∂f/∂x (Eq. (11) in the paper)
+% Computes the Jacobian matrix J_f = df/dx (Eq. (11) in the paper)
     x1 = x(1); x2 = x(2); x3 = x(3); x4 = x(4); x5 = x(5);
     c1 = filterCoeffs.c1;
     c2 = filterCoeffs.c2;
@@ -236,7 +270,6 @@ function J_f = compute_jacobian(x, v_tilde, filterCoeffs)
     
     fv = (1 - v_tilde^2)/((1 + v_tilde*x4)^2);
     
-    % --- Corrected Jacobian (1,1) entry: use 2*c1*(t1*x1) instead of 2*c1*(d1+t1*x1)
     J_f = -[ 2*c1*(t1*x1),       -c1*d1,          0,       c1*d1*fv,         0;...
              -c2*d2,         2*c2*(d2 + t2*x2),   -c2*d2,  0,                0;...
              0,              -c3*d3,          2*c3*(d3 + t3*x3), 0,       c3*d3;...
