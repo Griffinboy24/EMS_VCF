@@ -1,0 +1,204 @@
+import numpy as np
+import soundfile as sf
+import tkinter as tk
+from tkinter import filedialog
+from scipy.signal import resample_poly
+import numba as nb
+import time
+
+# ------------------------------------------------------------------------
+# Jitted inner loop functions.
+# ------------------------------------------------------------------------
+
+@nb.njit
+def vcs3_filter_dynamics_numba(x, vIN, c1, c2, c3, c4, c5, VT):
+    v_tilde = np.tanh(vIN / (2 * VT))
+    nonlin = (v_tilde + x[3]) / (1 + v_tilde * x[3])
+    dx = np.empty(5)
+    dx[0] = c1 * (x[1] - nonlin) * (1 - x[0]*x[0])
+    dx[1] = c2 * (x[2] - 2*x[1] + x[0]) * (1 - x[1]*x[1])
+    dx[2] = c3 * (-x[4] - 2*x[2] - x[1]) * (1 - x[2]*x[2])
+    dx[3] = c4 * (-x[4] - x[2]) * (1 - x[3]*x[3])
+    dx[4] = c5 * (-x[4] - x[2]) * (1 - x[4]*x[4])
+    return dx
+
+@nb.njit
+def compute_jacobian_numba(x, v_tilde, c1, c2, c3, c4, c5):
+    x1 = x[0]; x2 = x[1]; x3 = x[2]; x4 = x[3]; x5 = x[4]
+    d1 = 1 - x1*x1
+    d2 = 1 - x2*x2
+    d3 = 1 - x3*x3
+    d4 = 1 - x4*x4
+    d5 = 1 - x5*x5
+    t1 = x2 - (v_tilde + x4) / (1 + v_tilde*x4)
+    t2 = x3 - 2*x2 + x1
+    t3 = -x5 - 2*x3 - x2
+    t4 = -x5 - x3
+    t5 = t4
+    fv = (1 - v_tilde*v_tilde) / ((1 + v_tilde*x4) * (1 + v_tilde*x4))
+    M = np.zeros((5,5))
+    M[0,0] = 2*c1*(t1*x1)
+    M[0,1] = -c1*d1
+    M[0,2] = 0.0
+    M[0,3] = c1*d1*fv
+    M[0,4] = 0.0
+    M[1,0] = -c2*d2
+    M[1,1] = 2*c2*(d2 + t2*x2)
+    M[1,2] = -c2*d2
+    M[1,3] = 0.0
+    M[1,4] = 0.0
+    M[2,0] = 0.0
+    M[2,1] = -c3*d3
+    M[2,2] = 2*c3*(d3 + t3*x3)
+    M[2,3] = 0.0
+    M[2,4] = c3*d3
+    M[3,0] = 0.0
+    M[3,1] = 0.0
+    M[3,2] = c4*d4
+    M[3,3] = 2*c4*(t4*x4)
+    M[3,4] = c4*d4
+    M[4,0] = 0.0
+    M[4,1] = 0.0
+    M[4,2] = c5*d5
+    M[4,3] = 0.0
+    M[4,4] = c5*(d5 + 2*t5*x5)
+    return -M
+
+@nb.njit
+def vcs3_step_newton(x, F0, vIN_next, v_tilde, c1, c2, c3, c4, c5, VT, gamma, K, T):
+    tol = 1e-8
+    max_iter = 10
+    x_next = x.copy()
+    for i in range(max_iter):
+        f_val = vcs3_filter_dynamics_numba(x_next, vIN_next, c1, c2, c3, c4, c5, VT)
+        F_res = F0 + (T/2) * f_val - x_next
+        J_f = compute_jacobian_numba(x_next, v_tilde, c1, c2, c3, c4, c5)
+        J_F = (T/2) * J_f - np.eye(5)
+        # Use LAPACK-based solve (LU with pivoting)
+        delta = np.linalg.solve(J_F, -F_res)
+        x_next = x_next + delta
+        if np.max(np.abs(delta)) < tol:
+            break
+    F0_next = 2*x_next - F0
+    return x_next, F0_next
+
+@nb.njit
+def process_filter_core(inSignal_os, vTilde_os, I0_values, c1_values, c2_values,
+                        c3_values, c4_values, c5_values, T_os, VT, gamma, K, C):
+    N_os = inSignal_os.shape[0]
+    y_os = np.zeros(N_os)
+    x = np.zeros(5)
+    vC4 = 0.0
+    prev_I0 = I0_values[0]
+    f0 = vcs3_filter_dynamics_numba(x, inSignal_os[0],
+                                    c1_values[0], c2_values[0], c3_values[0],
+                                    c4_values[0], c5_values[0], VT)
+    F0 = (T_os/2) * f0
+    for n in range(N_os - 1):
+        c1 = c1_values[n]
+        c2 = c2_values[n]
+        c3 = c3_values[n]
+        c4 = c4_values[n]
+        c5 = c5_values[n]
+        I0 = I0_values[n]
+        vIN_next = inSignal_os[n+1]
+        v_tilde_next = vTilde_os[n+1]
+        x, F0 = vcs3_step_newton(x, F0, vIN_next, v_tilde_next,
+                                 c1, c2, c3, c4, c5, VT, gamma, K, T_os)
+        f_prev = -(prev_I0/(2*C)) * (x[4] + x[2])
+        f_now  = -(I0/(2*C)) * (x[4] + x[2])
+        vC4 = vC4 + (T_os/2) * (f_prev + f_now)
+        prev_I0 = I0
+        x[3] = np.tanh(- (K+0.5)*vC4/(2*VT))
+        x[4] = np.tanh(vC4/(6*gamma))
+        y_os[n] = (K+0.5) * vC4
+    return y_os
+
+# ------------------------------------------------------------------------
+# Main processing: file I/O, precomputations, and timing.
+# ------------------------------------------------------------------------
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    inputFile = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav")],
+                                           title="Select an input WAV file")
+    if not inputFile:
+        print("User selected Cancel.")
+        return
+
+    # Read input file.
+    inSignal, inFs = sf.read(inputFile)
+    if inSignal.ndim > 1:
+        inSignal = np.mean(inSignal, axis=1)
+    Fs = 44100
+    if inFs != Fs:
+        inSignal = resample_poly(inSignal, Fs, inFs)
+    inSignal = inSignal / np.max(np.abs(inSignal)) if np.max(np.abs(inSignal)) > 0 else inSignal
+    inputScale = 0.05
+    inSignal = inSignal * inputScale
+    preSilenceDuration = 0.5
+    preSilenceSamples = int(round(preSilenceDuration * Fs))
+    inSignal = np.concatenate((np.zeros(preSilenceSamples), inSignal))
+
+    # Oversampling.
+    oversample = 8
+    T = 1 / Fs
+    Fs_os = Fs * oversample
+    T_os = 1 / Fs_os
+    inSignal_os = resample_poly(inSignal, oversample, 1)
+    N_os = inSignal_os.shape[0]
+
+    # Filter constants.
+    eta = 1.836
+    VT = 26e-3
+    gamma = eta * VT
+    fc_start = 50
+    fc_end = 1000
+    K = 0.0
+    C = 0.1e-6
+
+    # Precompute cutoff modulation.
+    fc_values = np.logspace(np.log10(fc_start), np.log10(fc_end), N_os)
+    I0_values = 4 * np.pi * C * fc_values
+    c1_values = np.pi * fc_values / gamma
+    c2_values = c1_values.copy()
+    c3_values = c1_values.copy()
+    c4_values = np.pi * fc_values * (K+0.5) / VT
+    c5_values = np.pi * fc_values / (3 * gamma)
+
+    # Precompute vTilde: compute tanh on original signal then upsample.
+    vTilde_orig = np.tanh(inSignal / (2 * VT))
+    vTilde_os = resample_poly(vTilde_orig, oversample, 1)
+
+    # Time the processing.
+    start_time = time.perf_counter()
+    y_os = process_filter_core(inSignal_os, vTilde_os, I0_values, c1_values, c2_values,
+                               c3_values, c4_values, c5_values, T_os, VT, gamma, K, C)
+    end_time = time.perf_counter()
+    processing_time = end_time - start_time
+
+    # Downsample and scale output.
+    outputScale = 2.5
+    y = resample_poly(y_os, 1, oversample)
+    y = y * outputScale
+    preSilenceSamples_final = int(round(preSilenceDuration * Fs))
+    if len(y) > preSilenceSamples_final:
+        y = y[preSilenceSamples_final:]
+    
+    outputFile = filedialog.asksaveasfilename(defaultextension=".wav",
+                                              filetypes=[("WAV files", "*.wav")],
+                                              title="Save Processed WAV File As")
+    if not outputFile:
+        print("User selected Cancel for saving.")
+        return
+    sf.write(outputFile, y, Fs)
+    print("Processed file saved as:", outputFile)
+
+    # Print metrics.
+    audio_duration = len(inSignal) / Fs
+    print(f"Processing time: {processing_time:.3f} sec")
+    print(f"Audio duration: {audio_duration:.3f} sec")
+    print(f"Real-time factor: {processing_time / audio_duration:.3f}")
+
+if __name__ == '__main__':
+    main()
