@@ -39,7 +39,7 @@ end
 if max(abs(inSignal)) > 0
     inSignal = inSignal / max(abs(inSignal));
 end
-inputScale = 0.05;  % Scale factor (e.g., +/-50 mV)
+inputScale = 0.06;  % Scale factor (e.g., +/-50 mV)
 inSignal = inSignal * inputScale;
 
 %% 3.1) Prepend Silence Padding
@@ -64,14 +64,15 @@ eta     = 1.836;
 VT      = 26e-3;     % 26 mV
 gamma   = eta * VT;  % ~48 mV
 
-fc_start = 100;   % Initial cutoff frequency (Hz)
+fc_start = 50;   % Initial cutoff frequency (Hz)
 fc_end   = 1000;  % Final cutoff frequency (Hz)
 K       = 0.0;    % Feedback gain
 
 fc = fc_start;    % Initial cutoff
 
-% Corrected cutoff warping according to the paper:
-I0 = 16 * C * VT * Fs * tan(pi * fc / Fs);
+% --- Corrected cutoff scaling ---
+% Set I0 so that the small-signal pole is at 2*pi*fc. Thus:
+I0 = 2 * C * (2*pi*fc);  % I0 = 4*pi*C*fc
 
 % Precompute filter coefficients per Eq. (4)
 c1 = I0/(4*C*gamma);
@@ -120,9 +121,8 @@ for n = 1:N_os-1
     end
     
     % Update cutoff frequency and compute new I0 for this sample
-        fc = fc_values(n);
-    I0 = 16 * C * VT * Fs * tan(pi * fc / Fs);  % Correct bilinear warping update
-
+    fc = fc_values(n);
+    I0 = 2 * C * (2*pi*fc);  % Use fc directly (full cutoff frequency)
     
     % Update filter coefficients with the new I0
     filterCoeffs.I0 = I0;
