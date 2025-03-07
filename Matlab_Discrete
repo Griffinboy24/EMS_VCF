@@ -1,0 +1,170 @@
+% =========================================================================
+% EMS VCS3 VCF - EXACT IMPLEMENTATION (Zambon & Fontana, 2011),
+% with correct I0 from fc, input scaling, trapezoidal integration, etc.
+% =========================================================================
+
+clc; clear; close all;
+
+%% ------------------ 1) Define Constants and Desired fc ------------------
+C       = 0.1e-6;         % 0.1 microfarad
+eta     = 1.836;          
+VT      = 26e-3;          % 26 mV
+gamma   = eta * VT;       % ~48 mV
+
+fc      = 1000;           % desired cutoff frequency in Hz
+K       = 1;              % feedback gain (EMS "resonance" ~ 0..10)
+
+% The VCS3 paper says: "I0 is the bias current that sets the cutoff."
+% For a simple approximation, we do: I0 = 2*C*(2*pi*fc).
+% This sets vC's pole near fc in the linear small-signal sense.
+I0 = 2 * C * (2*pi*fc);
+
+%% ------------------ 2) Discretization Parameters ------------------
+Fs         = 44100;                 % base sampling rate
+T          = 1 / Fs;               
+oversample = 8;                    
+Fs_os      = Fs * oversample;      
+T_os       = 1 / Fs_os;            
+
+%% ------------------ 3) Load, Scale & Upsample Input ------------------
+%  (Must keep input amplitude in the tens-of-mV range to avoid tanh saturation.)
+
+[PinkNoise, Fs_in] = audioread('PinkNoise.wav');
+if Fs_in ~= Fs
+    error('Input file sampling rate mismatch!');
+end
+
+inputScale = 0.05;   % PinkNoise ±1 => ±50 mV
+PinkNoise  = PinkNoise * inputScale;
+
+% Upsample to Fs_os
+PinkNoise_os = resample(PinkNoise, oversample, 1, 100);
+
+% Output buffer (oversampled)
+y_os = zeros(size(PinkNoise_os));
+
+%% ------------------ 4) Initialize State Variables ------------------
+%  The "x" state is the 5 auxiliary variables in Eq. (4).
+x   = zeros(5,1);  
+vC4 = 0;   % actual capacitor voltage to get output = (K+1/2)*vC4
+
+% Initialize F0 as per the paper: F0,0 = (T/2)*f(x0).
+vIN0  = PinkNoise_os(1);
+f0    = vcs3_filter_dynamics(x, vIN0, I0, C, VT, gamma, K);
+F0    = (T_os/2)*f0;
+
+% For trapezoidal integration of vC4:
+f_prev = -(I0/(2*C))*(x(5)+x(3));
+
+%% ------------------ 5) Filter Processing (Oversampled) ------------------
+N = length(PinkNoise_os);
+for n = 1:N-1
+    % Next input sample
+    vIN_n1 = PinkNoise_os(n+1);
+
+    % Newton-Raphson update for x, also updates F0
+    [x, F0] = vcs3_step(x, F0, vIN_n1, I0, C, VT, gamma, K, T_os);
+
+    % Trapezoidal integration of vC4
+    f_now = -(I0/(2*C))*(x(5)+x(3));
+    vC4   = vC4 + (T_os/2)*(f_prev + f_now);
+    f_prev = f_now;
+
+    % Output = (K + 1/2)*vC4
+    y_os(n) = (K + 0.5)*vC4;
+end
+
+%% ------------------ 6) Downsample & Save Output ------------------
+y = resample(y_os, 1, oversample, 100);
+audiowrite('Filtered_PinkNoise.wav', y, Fs);
+
+%% ========================================================================
+%% =================== FUNCTION: vcs3_filter_dynamics ======================
+%% ========================================================================
+function dx = vcs3_filter_dynamics(x, vIN, I0, C, VT, gamma, K)
+    % From Eq. (4) in the paper, with the "addition formula" for tanh.
+    v_tilde = tanh(vIN/(2*VT));
+    x1=x(1); x2=x(2); x3=x(3); x4=x(4); x5=x(5);
+
+    c1 = I0/(4*C*gamma);
+    c2 = I0/(4*C*gamma);
+    c3 = I0/(4*C*gamma);
+    c4 = I0*(K+0.5)/(4*C*VT);
+    c5 = I0/(12*C*gamma);
+
+    dx = zeros(5,1);
+    dx(1) = c1*((x2 - v_tilde - x4)/(1 - v_tilde*x4))*(1 - x1^2);
+    dx(2) = c2*(x3 - 2*x2 + x1)*(1 - x2^2);
+    dx(3) = c3*(-x5 - 2*x3 - x2)*(1 - x3^2);
+    dx(4) = c4*(-x5 - x3)*(1 - x4^2);
+    dx(5) = c5*(-x5 - x3)*(1 - x5^2);
+end
+
+%% ========================================================================
+%% =================== FUNCTION: vcs3_step (Newton-Raphson) ===============
+%% ========================================================================
+function [x_next, F0_next] = vcs3_step(x, F0, vIN_next, I0, C, VT, gamma, K, T)
+    % Newton-Raphson iteration, as in Eqs. (7)-(9).
+    x_next   = x;
+    max_iter = 10;
+    tol      = 1e-8;
+
+    v_tilde = tanh(vIN_next/(2*VT));
+    for iter = 1:max_iter
+        f_val = vcs3_filter_dynamics(x_next, vIN_next, I0, C, VT, gamma, K);
+        F = F0 + (T/2)*f_val - x_next;
+
+        J_f = compute_jacobian(x_next, v_tilde, I0, C, VT, gamma, K);
+        J_F = (T/2)*J_f - eye(5);
+
+        % Solve for delta; fallback to pinv if near-singular
+        if rcond(J_F) < 1e-12
+            delta = pinv(J_F)*(-F);
+        else
+            delta = J_F\(-F);
+        end
+
+        x_next = x_next + delta;
+        if norm(delta,inf) < tol
+            break;
+        end
+    end
+    % F0 update from Eq. (8)
+    F0_next = 2*x_next - F0;
+end
+
+%% ========================================================================
+%% =================== FUNCTION: compute_jacobian ==========================
+%% ========================================================================
+function J_f = compute_jacobian(x, v_tilde, I0, C, VT, gamma, K)
+    x1=x(1); x2=x(2); x3=x(3); x4=x(4); x5=x(5);
+
+    c1 = I0/(4*C*gamma);
+    c2 = I0/(4*C*gamma);
+    c3 = I0/(4*C*gamma);
+    c4 = I0*(K+0.5)/(4*C*VT);
+    c5 = I0/(12*C*gamma);
+
+    d1 = 1 - x1^2;
+    d2 = 1 - x2^2;
+    d3 = 1 - x3^2;
+    d4 = 1 - x4^2;
+    d5 = 1 - x5^2;
+
+    t1 = x2 - v_tilde - x4;
+    t2 = x3 - 2*x2 + x1;
+    t3 = -x5 - 2*x3 - x2;
+    t4 = -x5 - x3;
+    t5 = -x5 - x3;
+
+    f_v = (v_tilde^2 - 1)/(1 - v_tilde*x4)^2;
+
+    % Eq. (11) from the paper
+    J_f = -[...
+        2*c1*(d1 + t1*x1),   -c1*d1,              0,         c1*d1*f_v,       0; ...
+        -c2*d2,              2*c2*(d2 + t2*x2),   -c2*d2,    0,               0; ...
+         0,                  -c3*d3,             2*c3*(d3 + t3*x3),  0,         c3*d3; ...
+         0,                   0,                  c4*d4,     2*c4*t4*x4,     c4*d4; ...
+         0,                   0,                  c5*d5,     0,              c5*(d5+2*t5*x5) ...
+    ];
+end
